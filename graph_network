@@ -1,1 +1,126 @@
+import os
+import glob
+import re
+import pandas as pd
+import networkx as nx
+import numpy as np
+from datetime import datetime
+from obspy import read
+from pyasdf import ASDFDataSet
 
+# Load gml graph
+gml_file_path = "GraphNoise/cumulative_network_new.gml"
+graph = nx.read_gml(gml_file_path)
+print("gml loaded")
+
+# Load csv file containing sac metadata
+csv_file_path = "GraphNoise/updated_wikifile.csv"
+csv_data = pd.read_csv(csv_file_path)
+print("csv loaded")
+
+def process_single_station(station, graph, sac_folder, output_file, overwrite=False, verbose=True):
+    # Handle file overwriting
+    if os.path.exists(output_file):
+        if overwrite:
+            os.remove(output_file)
+            if verbose:
+                print(f"File '{output_file}' exists. Overwriting...")
+        else:
+            raise FileExistsError(f"File '{output_file}' already exists. Use overwrite=True to replace it.")
+
+    # Create the ASDF file
+    asdf_ds = ASDFDataSet(output_file, compression="lzf")
+
+    # Get connected nodes for the station
+    connected_nodes = list(graph.neighbors(station))
+    if verbose:
+        print(f"Station '{station}' is connected to: {connected_nodes}")
+
+    # Collect SAC file information for only the connected days
+    sac_files_added = []
+    dates = []
+    for connected_node in connected_nodes:
+        if graph.has_edge(station, connected_node):
+            edges = graph[station][connected_node]
+            if 'dates' in edges:
+                dates.extend(edges['dates'])
+            else:
+                print(f"Warning: No 'dates' attribute for edge between {station} and {connected_node}.")
+
+    # Keep only unique dates
+    unique_dates = sorted(set(dates))
+    
+    # Process SAC files for the target station
+    for date in unique_dates:
+        # Format the date to match SAC file naming convention
+        date_str = datetime.strptime(date, "%Y_%m_%d").strftime("%Y.%j")
+        print(f"Processing date: {date} (formatted: {date_str})")
+
+        # Find SAC files for the target station
+        station_name = station.split("/")[-1]  # Extract the station's folder name
+        sac_folder_path = os.path.join(sac_folder, station_name)
+        search_path = os.path.join(sac_folder_path, f"*{date_str}*.sac")
+        sac_files = glob.glob(search_path)
+        if not sac_files and verbose:
+            print(f"No SAC files found for station: {station_name} on date: {date_str}.")
+        else:
+            print(f"Found SAC files for station: {station_name} on date: {date_str}: {sac_files}")
+
+        # Add SAC files for the target station
+        for sac_file in sac_files:
+            try:
+                st = read(sac_file)
+                valid_tag = re.sub(r"[^a-z0-9_]", "_", f"{st[0].stats.station}_{date_str}".lower())
+                print(f"Adding SAC file '{sac_file}' with tag '{valid_tag}'")
+                asdf_ds.add_waveforms(sac_file, tag=valid_tag)
+                sac_files_added.append(sac_file)
+            except Exception as e:
+                print(f"Error adding SAC file '{sac_file}': {e}")
+
+    # Process SAC files for connected nodes
+    for connected_node in connected_nodes:
+        connected_node_name = connected_node.split("/")[-1]  # Extract the folder name
+        connected_node_folder = os.path.join(sac_folder, connected_node_name)
+        for date in unique_dates:
+            date_str = datetime.strptime(date, "%Y_%m_%d").strftime("%Y.%j")
+            search_path = os.path.join(connected_node_folder, f"*{date_str}*.sac")
+            sac_files = glob.glob(search_path)
+            if not sac_files and verbose:
+                print(f"No SAC files found for connected node: {connected_node_name} on date: {date_str}.")
+            else:
+                print(f"Found SAC files for connected node: {connected_node_name} on date: {date_str}: {sac_files}")
+
+            # Add SAC files for the connected node
+            for sac_file in sac_files:
+                try:
+                    st = read(sac_file)
+                    valid_tag = re.sub(r"[^a-z0-9_]", "_", f"{st[0].stats.station}_{date_str}".lower())
+                    print(f"Adding SAC file '{sac_file}' with tag '{valid_tag}'")
+                    asdf_ds.add_waveforms(sac_file, tag=valid_tag)
+                    sac_files_added.append(sac_file)
+                except Exception as e:
+                    print(f"Error adding SAC file '{sac_file}': {e}")
+
+    # Save the list of connected nodes
+    connected_nodes_array = np.array(connected_nodes, dtype="S")
+    asdf_ds.add_auxiliary_data(
+        data=connected_nodes_array,
+        data_type="connections",
+        path=station.replace(".", "_"),
+        parameters={"description": "List of connected nodes for the station"}
+    )
+
+    if verbose:
+        print(f"Processing complete for station: {station}. File saved at {output_file}.")
+        print(f"Total SAC files added: {len(sac_files_added)}")
+
+
+# Paths
+sac_folder_path = "/home/ljiang14/sample_sac"
+output_asdf_file = "GraphNoise/DW_TOL_output_test6.h5"
+
+# Station name
+station_name = "DataDW/TOL"
+
+# Process the single station
+process_single_station(station_name, graph, sac_folder_path, output_asdf_file, overwrite=True)
