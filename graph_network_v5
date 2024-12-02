@@ -1,0 +1,173 @@
+import os
+import glob
+import re
+import pandas as pd
+import networkx as nx
+import numpy as np
+from datetime import datetime
+from obspy import read
+import pyasdf 
+from pyasdf import ASDFDataSet
+import h5py
+
+# Load gml graph
+gml_file_path = "GraphNoise/cumulative_network_new.gml"
+graph = nx.read_gml(gml_file_path)
+print("gml loaded")
+
+def process_single_station(station, graph, sac_folder, output_file, overwrite=False, verbose=True):
+    if os.path.exists(output_file):
+        if overwrite:
+            os.remove(output_file)
+            if verbose:
+                print(f"File '{output_file}' exists. Overwriting...")
+        else:
+            raise FileExistsError(f"File '{output_file}' already exists. Use overwrite=True to replace it.")
+
+    # create asdf file without compression
+    asdf_ds = pyasdf.ASDFDataSet(output_file)
+
+    # get connected nodes
+    connected_nodes = list(graph.neighbors(station))
+    if verbose:  # if verbose is False, this will not print
+        print(f"Station '{station}' is connected to: {connected_nodes}")
+
+    sac_files_added = [] # list
+    connected_nodes_dates = {} # dictionary, will have connected node name and its dates
+
+    for connected_node in connected_nodes:
+        if graph.has_edge(station, connected_node):
+            edges = graph[station][connected_node]
+            if 'dates' in edges:
+                connected_nodes_dates[connected_node] = edges['dates']
+            else:
+                print(f"Warning: No 'dates' attribute for edge between {station} and {connected_node}.")
+                connected_nodes_dates[connected_node] = []
+
+    # Get unique dates for the target station
+    all_dates = [date for dates in connected_nodes_dates.values() for date in dates]
+    unique_dates = sorted(set(all_dates))
+
+    for date in unique_dates:
+        date_str = datetime.strptime(date, "%Y_%m_%d").strftime("%Y.%j") # to match SAC file names
+        print(f"Processing date: {date}")
+
+        station_name = station.split("/")[-1]  # Extract the station's folder name
+        sac_folder_path = os.path.join(sac_folder, station_name)
+        search_path = os.path.join(sac_folder_path, f"*{date_str}*.sac")
+        sac_files = glob.glob(search_path)
+
+        if not sac_files and verbose:
+            print(f"No SAC files found for station: {station_name} on date: {date_str}.")
+        else:
+            print(f"Found SAC files for station: {station_name} on date: {date_str}: {sac_files}")
+
+        for sac_file in sac_files:
+            try:
+                st = read(sac_file)
+                valid_tag = re.sub(r"[^a-z0-9_]", "_", f"{st[0].stats.station}_{date_str}".lower())
+                print(f"Adding SAC file '{sac_file}' with tag '{valid_tag}'")
+                asdf_ds.add_waveforms(sac_file, tag=valid_tag)
+                sac_files_added.append(sac_file)
+            except Exception as e:
+                print(f"Error adding SAC file '{sac_file}': {e}")
+
+    # Save auxiliary data for the list of connected nodes
+    asdf_ds.add_auxiliary_data(
+        data=np.array(connected_nodes, dtype="S"),  # convert to np array
+        data_type="connections",
+        path=f"{station.replace('.', '_')}_nodes",
+        parameters={"description": "List of connected nodes for the station"}
+    )
+
+    # Save auxiliary data for dates of each connected node
+    for node, dates in connected_nodes_dates.items():
+        dates_array = np.array(dates, dtype="S")  # convert to np array
+        asdf_ds.add_auxiliary_data(
+            data=dates_array,
+            data_type="connections",
+            path=f"{station.replace('.', '_')}_{node.replace('.', '_')}_dates",
+            parameters={"description": f"Dates connected to the node {node}"}
+        )
+
+
+    print(f"Processing complete for station: {station}. File saved at {output_file}.")
+    print(f"Total SAC files added: {len(sac_files_added)}")
+
+
+# Process a single station
+sac_folder_path = "/home/ljiang14/sample_sac"
+output_asdf_file = "GraphNoise/DW_TOL_output_test10.h5"
+
+station_name = "DataDW/TOL"
+process_single_station(station_name, graph, sac_folder_path, output_asdf_file, overwrite=True)
+
+
+# Check ASDF file size
+asdf_file_path = "/home/ljiang14/GraphNoise/DW_TOL_output_test10.h5"
+asdf_size = os.path.getsize(asdf_file_path)
+asdf_size_mb = asdf_size / (1024 ** 2)
+
+print(f"Size of ASDF file '{asdf_file_path}': {asdf_size_mb:.2f} MB")
+
+# Check waveforms
+with h5py.File(asdf_file_path, "r") as f:
+    if "Waveforms" in f:
+        for station in f["Waveforms"]:
+            print(f"Station: {station}")
+            station_group = f["Waveforms"][station]
+            for key in station_group:
+                print(f"{key}")
+    else:
+        print("No Waveforms group found in the file.")
+
+# Check auxiliary data
+with h5py.File(asdf_file_path, "r") as f:
+    print("Top-level groups:")
+    print(list(f.keys())) 
+    
+    for data_type in f["AuxiliaryData"]:
+        print(f"Data Type: {data_type}")
+        for path in f["AuxiliaryData"][data_type]:
+            print(f"Path: {path}")
+
+with h5py.File(asdf_file_path, "r") as f:
+    group_path = "AuxiliaryData/connections"
+
+    if group_path in f:
+        print(f"\nContents of {group_path}:")
+        for item_name in f[group_path]:
+            dataset_path = f"{group_path}/{item_name}"
+            print(f"\nItem: {item_name}")
+            
+            # Check if the item is a group or a dataset
+            if isinstance(f[dataset_path], h5py.Dataset):
+                # If it's a dataset, read its data
+                print("Type: Dataset")
+                print("Attributes:")
+                for key, value in f[dataset_path].attrs.items():
+                    print(f"{key}: {value}")
+                print("  Data:")
+                print(f[dataset_path][:])  # Access dataset contents
+            elif isinstance(f[dataset_path], h5py.Group):
+                # If it's a group, list its contents
+                print("Type: Group")
+                print("Contents:")
+                print(list(f[dataset_path].keys()))
+            else:
+                print("Unknown type")
+    else:
+        print(f"{group_path} not found in the file.")
+
+with h5py.File(output_asdf_file, "r") as f:
+    dataset_path = "AuxiliaryData/connections/DataDW/TOL_DataG/TAM_dates"
+    
+    if dataset_path in f:
+        # Retrieve the dataset contents
+        tam_dates = f[dataset_path][:]
+        # Decode bytes to strings (if necessary)
+        decoded_dates = [date.decode("utf-8") for date in tam_dates]
+        print(f"Dates for 'TAM': {decoded_dates}")
+    else:
+        print(f"{dataset_path} not found.")
+
